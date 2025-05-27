@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -64,6 +65,12 @@ func forwardProxy(w http.ResponseWriter, originalReq *http.Request) {
 	}
 	defer res.Body.Close()
 
+	newBody, err := checkForBannedWords(res.Body, w)
+	if err != nil {
+		return
+	}
+	res.Body = newBody
+
 	for name, values := range res.Header {
 		if !isHopByHop(name) {
 			w.Header()[name] = values
@@ -107,20 +114,42 @@ func shouldPreventProxy(host, bannedHostsOrWords string) bool {
 	}
 	defer file.Close()
 
-	// Create a new scanner to read the file line by line
 	scanner := bufio.NewScanner(file)
 
-	// Loop through the file and read each line
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == host {
 			return true
 		}
 
-		// Check for errors during the scan
 		if err := scanner.Err(); err != nil {
 			log.Fatalf("error reading file: %s", err)
 		}
 	}
 	return false
+}
+
+func checkForBannedWords(body io.ReadCloser, w http.ResponseWriter) (io.ReadCloser, error) {
+	bodyClone := &bytes.Buffer{}
+	tee := io.TeeReader(body, bodyClone)
+
+	newBody := &bytes.Buffer{}
+	_, err := io.Copy(newBody, tee)
+	if err != nil {
+		return nil, err
+	}
+	body.Close()
+
+	scanner := bufio.NewScanner(bodyClone)
+	scanner.Split(bufio.ScanWords)
+	for scanner.Scan() {
+		word := scanner.Text()
+		if shouldPreventProxy(word, forbiddenWordsFileName) {
+			w.WriteHeader(403)
+			w.Write([]byte("Website content not allowed."))
+			return nil, fmt.Errorf("banned word found")
+		}
+	}
+
+	return io.NopCloser(bytes.NewReader(newBody.Bytes())), nil
 }
