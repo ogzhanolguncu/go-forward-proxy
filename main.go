@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -17,13 +18,8 @@ import (
 )
 
 // TODOS
-// # PROXY SERVER TODO LIST
-//
-// ## 🔧 Improvements (Good to Have)
-//
 // ### 4. **Security Enhancements**
 // - [ ] Add rate limiting per client IP
-// - [ ] Validate request sizes (prevent DoS)
 // - [ ] Add request timeout limits
 // - [ ] Consider adding authentication
 // - [ ] Add IP whitelisting/blacklisting
@@ -33,30 +29,12 @@ import (
 // - [ ] Implement caching for frequently accessed content
 // - [ ] Add concurrent limits to prevent resource exhaustion
 //
-// ### 6. **Better Logging**
-// - [ ] Add configurable log levels (DEBUG, INFO, WARN, ERROR)
-// - [ ] Implement log rotation to prevent disk filling
-// - [ ] Add metrics/statistics logging
-// - [ ] Add structured logging (JSON format option)
-//
+
 // ### 7. **Configuration Management**
 // - [ ] Make server address configurable via flags/env vars
 // - [ ] Make timeouts configurable
 // - [ ] Add hot-reload for forbidden lists
 // - [ ] Add configuration file support (YAML/JSON)
-//
-// ### 8. **Error Handling Improvements**
-// - [ ] Add better client error messages
-// - [ ] Implement graceful degradation for file access issues
-// - [ ] Add health check endpoint (`/health`, `/status`)
-// - [ ] Add proper HTTP status codes for different error types
-//
-// **Phase 4 (Polish - Do Eventually):**
-// 7. Configuration management
-// 8. Error handling improvements
-// 9. Code quality improvements
-//
-
 var (
 	forbiddenHostNames map[string]bool = make(map[string]bool)
 	forbiddenWords     map[string]bool = make(map[string]bool)
@@ -71,6 +49,10 @@ const (
 )
 
 func forwardProxy(w http.ResponseWriter, originalReq *http.Request) {
+	if originalReq.URL.Path == "/health" {
+		healthHandler(w)
+		return
+	}
 	originalReq.Body = http.MaxBytesReader(w, originalReq.Body, proxyRequestLimit)
 
 	startTime := time.Now()
@@ -322,6 +304,39 @@ func main() {
 	}
 
 	log.Printf("=== PROXY SERVER STOPPED ===")
+}
+
+type HealthResponse struct {
+	Status       string `json:"status"`
+	Timestamp    string `json:"timestamp"`
+	Uptime       int64  `json:"uptime"`
+	ResponseTime int64  `json:"responseTime"`
+}
+
+var startTime = time.Now()
+
+func healthHandler(w http.ResponseWriter) {
+	start := time.Now()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+
+	response := HealthResponse{
+		Status:    "healthy",
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Uptime:    int64(time.Since(startTime).Seconds()),
+	}
+
+	httpStatus := http.StatusOK
+
+	response.ResponseTime = time.Since(start).Milliseconds()
+
+	w.WriteHeader(httpStatus)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("Failed to encode health response: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 }
 
 func setupLogging() *os.File {
