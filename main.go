@@ -1,17 +1,31 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
+)
+
+const (
+	forbiddenHostsFileName = "forbidden-hosts.txt"
+	forbiddenWordsFileName = "banned-words.txt"
 )
 
 func forwardProxy(w http.ResponseWriter, originalReq *http.Request) {
 	log.Printf("Request made. Target: %s Client: %s", originalReq.Host, originalReq.RemoteAddr)
+
+	// Prevent banned hosts
+	if shouldPreventProxy(originalReq.Host, forbiddenHostsFileName) {
+		w.WriteHeader(403)
+		w.Write([]byte("Website not allowed: facebook.com"))
+		return
+	}
 
 	client := &http.Client{}
 
@@ -84,4 +98,29 @@ func isHopByHop(header string) bool {
 		"upgrade":             true,
 	}
 	return hopByHop[strings.ToLower(header)]
+}
+
+func shouldPreventProxy(host, bannedHostsOrWords string) bool {
+	file, err := os.Open(bannedHostsOrWords)
+	if err != nil {
+		log.Fatalf("failed to open file: %s", err)
+	}
+	defer file.Close()
+
+	// Create a new scanner to read the file line by line
+	scanner := bufio.NewScanner(file)
+
+	// Loop through the file and read each line
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == host {
+			return true
+		}
+
+		// Check for errors during the scan
+		if err := scanner.Err(); err != nil {
+			log.Fatalf("error reading file: %s", err)
+		}
+	}
+	return false
 }
