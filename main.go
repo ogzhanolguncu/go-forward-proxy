@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,7 +11,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 )
 
 const (
@@ -21,10 +25,16 @@ const (
 func forwardProxy(w http.ResponseWriter, originalReq *http.Request) {
 	log.Printf("Request made. Target: %s Client: %s", originalReq.Host, originalReq.RemoteAddr)
 
-	// Prevent banned hosts
+	clientIP, _, err := net.SplitHostPort(originalReq.RemoteAddr)
+	if err != nil {
+		clientIP = originalReq.RemoteAddr
+	}
+
+	log.Printf("ClientIP %s\n", clientIP)
 	if shouldPreventProxy(originalReq.Host, forbiddenHostsFileName) {
 		w.WriteHeader(403)
 		w.Write([]byte("Website not allowed: facebook.com"))
+		log.Printf("Found a banned host %s for client %s\n", originalReq.Host, clientIP)
 		return
 	}
 
@@ -38,12 +48,6 @@ func forwardProxy(w http.ResponseWriter, originalReq *http.Request) {
 		http.Error(w, "Failed to create request", http.StatusInternalServerError)
 		return
 	}
-
-	clientIP, _, err := net.SplitHostPort(originalReq.RemoteAddr)
-	if err != nil {
-		clientIP = originalReq.RemoteAddr
-	}
-	log.Printf("ClientIP %s\n", clientIP)
 
 	proxyReq.Header.Set("X-Forwarded-For", originalReq.RemoteAddr)
 	for name, values := range originalReq.Header {
@@ -65,7 +69,7 @@ func forwardProxy(w http.ResponseWriter, originalReq *http.Request) {
 	}
 	defer res.Body.Close()
 
-	newBody, err := checkForBannedWords(res.Body, w)
+	newBody, err := checkForBannedWords(res.Body, w, clientIP)
 	if err != nil {
 		return
 	}
@@ -78,6 +82,7 @@ func forwardProxy(w http.ResponseWriter, originalReq *http.Request) {
 	}
 	w.WriteHeader(res.StatusCode)
 
+	log.Printf("Proxy request successfully made for client: %s and status is %d", clientIP, res.StatusCode)
 	_, err = io.Copy(w, res.Body)
 	if err != nil {
 		log.Printf("failed to copy response body: %v", err)
@@ -85,11 +90,58 @@ func forwardProxy(w http.ResponseWriter, originalReq *http.Request) {
 }
 
 func main() {
+	logFile := setupLogging()
+	defer logFile.Close()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", forwardProxy)
 
-	log.Printf("Starting proxy server on 127.0.0.1:8090")
-	http.ListenAndServe("localhost:8090", mux)
+	server := &http.Server{
+		Addr:         "127.0.0.1:8090",
+		Handler:      mux,
+		ReadTimeout:  15 * time.Second, // Time to read request headers + body
+		WriteTimeout: 15 * time.Second, // Time to write response
+		IdleTimeout:  60 * time.Second, // Keep-alive timeout
+		// Prevent Slowloris attacks
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	// Start server in goroutine
+	go func() {
+		log.Printf("Starting proxy server on %s", server.Addr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server failed to start: %v", err)
+		}
+	}()
+
+	// Graceful shutdown
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Printf("Shutting down server...")
+
+	// Give server 30 seconds to finish ongoing requests
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("Server forced to shutdown: %v", err)
+	}
+
+	log.Printf("Server stopped")
+}
+
+func setupLogging() *os.File {
+	file, err := os.OpenFile("proxy.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatalf("Cannot open log file: %v", err)
+	}
+
+	log.SetOutput(file)
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
+	return file
 }
 
 func isHopByHop(header string) bool {
@@ -129,7 +181,7 @@ func shouldPreventProxy(host, bannedHostsOrWords string) bool {
 	return false
 }
 
-func checkForBannedWords(body io.ReadCloser, w http.ResponseWriter) (io.ReadCloser, error) {
+func checkForBannedWords(body io.ReadCloser, w http.ResponseWriter, clientIP string) (io.ReadCloser, error) {
 	bodyClone := &bytes.Buffer{}
 	tee := io.TeeReader(body, bodyClone)
 
@@ -147,6 +199,7 @@ func checkForBannedWords(body io.ReadCloser, w http.ResponseWriter) (io.ReadClos
 		if shouldPreventProxy(word, forbiddenWordsFileName) {
 			w.WriteHeader(403)
 			w.Write([]byte("Website content not allowed."))
+			log.Printf("Found a banned word %s for client %s\n", word, clientIP)
 			return nil, fmt.Errorf("banned word found")
 		}
 	}
