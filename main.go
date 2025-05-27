@@ -19,26 +19,6 @@ import (
 // TODOS
 // # PROXY SERVER TODO LIST
 //
-// ## 🚨 Critical Bugs (Must Fix)
-//
-// ### 1. **File I/O Performance Crisis**
-// - [ ] Replace `shouldPreventProxy` with in-memory maps
-// - [ ] Load forbidden files once at startup, not on every request
-// - [ ] **Current impact**: 1000+ file reads per page with word filtering
-// - [ ] **Priority**: HIGHEST - Makes proxy unusable under load
-//
-// ## ⚠️ Functional Bugs (Should Fix)
-//
-// ### 2. **Missing Error Propagation in Tunnels**
-// - [ ] Add error handling for `io.Copy` failures in `handleConnect`
-// - [ ] Log when tunnel copying fails
-// - [ ] **Current impact**: Silent tunnel failures, no visibility into connection issues
-//
-// ### 3. **Resource Management** ✅ PARTIALLY FIXED
-// - [x] ~~Ensure `originalReq.Body` is always closed in `handleHTTP`~~ - Added `defer originalReq.Body.Close()`
-// - [ ] Add proper cleanup for failed connections in `handleConnect`
-// - [ ] Ensure target connections are cleaned up on errors
-//
 // ## 🔧 Improvements (Good to Have)
 //
 // ### 4. **Security Enhancements**
@@ -52,7 +32,6 @@ import (
 // - [ ] Add connection pooling for upstream requests
 // - [ ] Implement caching for frequently accessed content
 // - [ ] Add concurrent limits to prevent resource exhaustion
-// - [ ] Optimize word scanning algorithm (Boyer-Moore, etc.)
 //
 // ### 6. **Better Logging**
 // - [ ] Add configurable log levels (DEBUG, INFO, WARN, ERROR)
@@ -72,56 +51,28 @@ import (
 // - [ ] Add health check endpoint (`/health`, `/status`)
 // - [ ] Add proper HTTP status codes for different error types
 //
-// ### 9. **Code Quality**
-// - [ ] Add unit tests for core functions
-// - [ ] Split large functions into smaller, testable units
-// - [ ] Add proper struct types instead of passing many parameters
-// - [ ] Add documentation and comments
-// - [ ] Add input validation
-//
-// ## 📋 Priority Order
-//
-// **Phase 1 (Critical - Do First):**
-// 1. ✅ File I/O performance (in-memory caching)
-//
-// **Phase 2 (Important - Do Soon):**
-// 2. Error handling for tunnel failures
-// 3. Resource cleanup improvements
-//
-// **Phase 3 (Nice to Have - Do Later):**
-// 4. Security enhancements
-// 5. Performance optimizations
-// 6. Better logging
-//
 // **Phase 4 (Polish - Do Eventually):**
 // 7. Configuration management
 // 8. Error handling improvements
 // 9. Code quality improvements
 //
-// ## 🚀 Quick Wins (Easy to implement)
-//
-// - [x] ~~Add `defer originalReq.Body.Close()` in `handleHTTP`~~ - DONE
-// - [ ] Add basic request size validation
-// - [ ] Make log level configurable with environment variable
-// - [ ] Add simple health check endpoint
-// - [ ] Add error logging for `io.Copy` failures in tunnels
-//
-// ## ❌ Removed/Not Issues
-//
-// - ~~Content-Length Header Corruption~~ - **Not an issue**: When banned words are found, entire response is replaced with 403 error, so original Content-Length is never used
-//
-// ## 🎯 Next Steps
-//
-// 1. **Start with #1** - File I/O performance is critical
-// 2. **Then #2** - Add tunnel error handling
-// 3. **Quick wins** - Add the easy improvements while working on bigger items
+
+var (
+	forbiddenHostNames map[string]bool = make(map[string]bool)
+	forbiddenWords     map[string]bool = make(map[string]bool)
+)
 
 const (
+	proxyRequestLimit = 64 * 1024 // 64KB
+	proxyHeaderLimit  = 8 * 1024  // 8KB
+
 	forbiddenHostsFileName = "forbidden-hosts.txt"
 	forbiddenWordsFileName = "banned-words.txt"
 )
 
 func forwardProxy(w http.ResponseWriter, originalReq *http.Request) {
+	originalReq.Body = http.MaxBytesReader(w, originalReq.Body, proxyRequestLimit)
+
 	startTime := time.Now()
 	log.Printf("=== INCOMING REQUEST === Target: %s | Client: %s | Method: %s | UserAgent: %s",
 		originalReq.Host, originalReq.RemoteAddr, originalReq.Method, originalReq.UserAgent())
@@ -138,7 +89,7 @@ func forwardProxy(w http.ResponseWriter, originalReq *http.Request) {
 	if colonIndex := strings.LastIndex(hostToCheck, ":"); colonIndex != -1 {
 		hostToCheck = hostToCheck[:colonIndex]
 	}
-	if shouldPreventProxy(hostToCheck, forbiddenHostsFileName) {
+	if checkForBannedHosts(hostToCheck) {
 		duration := time.Since(startTime)
 
 		if originalReq.Method == http.MethodConnect {
@@ -285,17 +236,35 @@ func handleConnect(w http.ResponseWriter, originalReq *http.Request, clientIP st
 
 	log.Printf("CONNECT_TUNNEL_ESTABLISHED: Host=%s | Client=%s", originalReq.Host, clientIP)
 
-	done := make(chan struct{})
+	done := make(chan struct{}, 2)
 
 	go func() {
-		io.Copy(clientConn, targetConn)
-		done <- struct{}{}
-	}()
-	go func() {
-		io.Copy(targetConn, clientConn)
-		done <- struct{}{}
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("CONNECT_TUNNEL_PANIC: client->target panic: %v", r)
+			}
+			done <- struct{}{}
+		}()
+		_, err := io.Copy(clientConn, targetConn)
+		if err != nil {
+			log.Printf("CONNECT_TUNNEL_ERROR: client->target error: %v", err)
+		}
 	}()
 
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("CONNECT_TUNNEL_PANIC: target->client panic: %v", r)
+			}
+			done <- struct{}{}
+		}()
+		_, err := io.Copy(targetConn, clientConn)
+		if err != nil {
+			log.Printf("CONNECT_TUNNEL_ERROR: target->client error: %v", err)
+		}
+	}()
+
+	<-done
 	<-done
 
 	duration := time.Since(startTime)
@@ -310,6 +279,8 @@ func main() {
 	log.Printf("=== PROXY SERVER STARTING ===")
 	log.Printf("CONFIG: ForbiddenHostsFile=%s | ForbiddenWordsFile=%s", forbiddenHostsFileName, forbiddenWordsFileName)
 
+	loadForbiddenWordsAndHosts()
+
 	server := &http.Server{
 		Addr:         "127.0.0.1:8090",
 		Handler:      http.HandlerFunc(forwardProxy),
@@ -318,6 +289,7 @@ func main() {
 		IdleTimeout:  60 * time.Second, // Keep-alive timeout
 		// Prevent Slowloris attacks
 		ReadHeaderTimeout: 5 * time.Second,
+		MaxHeaderBytes:    proxyHeaderLimit,
 	}
 
 	log.Printf("SERVER_CONFIG: Address=%s | ReadTimeout=%v | WriteTimeout=%v | IdleTimeout=%v | ReadHeaderTimeout=%v",
@@ -358,7 +330,7 @@ func setupLogging() *os.File {
 		log.Fatalf("LOG_SETUP_FATAL: Cannot open log file: %v", err)
 	}
 
-	log.SetOutput(file)
+	// log.SetOutput(file)
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
 	log.Printf("=== LOGGING INITIALIZED === LogFile=proxy.log | PID=%d | StartTime=%v",
@@ -382,35 +354,20 @@ func isHopByHop(header string) bool {
 	return hopByHop[strings.ToLower(header)]
 }
 
-func shouldPreventProxy(host, bannedHostsOrWords string) bool {
-	file, err := os.Open(bannedHostsOrWords)
-	if err != nil {
-		log.Printf("ERROR_FILE_OPEN: File=%s | Error=%v", bannedHostsOrWords, err)
-		log.Fatalf("FATAL_FILE_ACCESS: Cannot continue without access to %s", bannedHostsOrWords)
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	lineCount := 0
-
-	for scanner.Scan() {
-		lineCount++
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue // Skip empty lines and comments
-		}
-
-		if strings.Contains(host, line) {
-			log.Printf("FILE_CHECK_MATCH: File=%s | Line=%d | CheckedHost=%s", bannedHostsOrWords, lineCount, host)
-			return true
-		}
-
-		if err := scanner.Err(); err != nil {
-			log.Printf("ERROR_FILE_SCAN: File=%s | Line=%d | Error=%v", bannedHostsOrWords, lineCount, err)
-			log.Fatalf("FATAL_FILE_SCAN: Cannot scan file %s", bannedHostsOrWords)
-		}
+func checkForBannedHosts(host string) bool {
+	if _, found := forbiddenHostNames[host]; found {
+		log.Printf("FILE_CHECK_MATCH: File=%s | CheckedHost=%s", forbiddenHostsFileName, host)
+		return true
 	}
 
+	return false
+}
+
+func bannedWordLookup(word string) bool {
+	if _, found := forbiddenWords[word]; found {
+		log.Printf("FILE_CHECK_MATCH: File=%s | CheckedWord=%s", forbiddenWordsFileName, word)
+		return true
+	}
 	return false
 }
 
@@ -441,7 +398,7 @@ func checkForBannedWords(body io.ReadCloser, w http.ResponseWriter, clientIP str
 			continue
 		}
 
-		if shouldPreventProxy(word, forbiddenWordsFileName) {
+		if bannedWordLookup(word) {
 			w.WriteHeader(403)
 			w.Write([]byte("Website content not allowed."))
 			log.Printf("BLOCKED_WORD_FOUND: Client=%s | WordPosition=%d | TotalBytesScanned=%d",
@@ -454,4 +411,56 @@ func checkForBannedWords(body io.ReadCloser, w http.ResponseWriter, clientIP str
 		clientIP, wordCount, bytesRead)
 
 	return io.NopCloser(bytes.NewReader(newBody.Bytes())), nil
+}
+
+func loadForbiddenWordsAndHosts() {
+	file, err := os.Open(forbiddenHostsFileName)
+	if err != nil {
+		log.Printf("ERROR_FILE_OPEN: File=%s | Error=%v", forbiddenHostsFileName, err)
+		log.Fatalf("FATAL_FILE_ACCESS: Cannot continue without access to %s", forbiddenHostsFileName)
+	}
+
+	scanner := bufio.NewScanner(file)
+	lineCount := 0
+	for scanner.Scan() {
+		lineCount++
+		if err := scanner.Err(); err != nil {
+			log.Printf("ERROR_FILE_SCAN: File=%s | Line=%d | Error=%v", forbiddenHostsFileName, lineCount, err)
+			log.Fatalf("FATAL_FILE_SCAN: Cannot scan file %s", forbiddenHostsFileName)
+		}
+
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue // Skip empty lines and comments
+		}
+
+		forbiddenHostNames[line] = true
+	}
+	file.Close()
+
+	file, err = os.Open(forbiddenWordsFileName)
+	if err != nil {
+		log.Printf("ERROR_FILE_OPEN: File=%s | Error=%v", forbiddenWordsFileName, err)
+		log.Fatalf("FATAL_FILE_ACCESS: Cannot continue without access to %s", forbiddenWordsFileName)
+	}
+
+	scanner = bufio.NewScanner(file)
+	scanner.Split(bufio.ScanWords)
+	wordCount := 0
+	for scanner.Scan() {
+		wordCount++
+		if err := scanner.Err(); err != nil {
+			log.Printf("ERROR_FILE_SCAN: File=%s | Line=%d | Error=%v", forbiddenWordsFileName, wordCount, err)
+			log.Fatalf("FATAL_FILE_SCAN: Cannot scan file %s", forbiddenWordsFileName)
+		}
+
+		word := strings.ToLower(strings.TrimSpace(scanner.Text()))
+		if word == "" {
+			continue
+		}
+		forbiddenWords[word] = true
+	}
+	file.Close()
+
+	log.Printf("FORBIDDEN_UPDATE: Forbidden words and hosts loaded into memory")
 }
