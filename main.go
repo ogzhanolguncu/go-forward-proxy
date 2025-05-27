@@ -13,22 +13,12 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
-)
 
-// TODOS
-// ### 4. **Security Enhancements**
-// - [ ] Add rate limiting per client IP
-// - [ ] Add request timeout limits
-// - [ ] Consider adding authentication
-// - [ ] Add IP whitelisting/blacklisting
-//
-// ### 5. **Performance Optimizations**
-// - [ ] Add connection pooling for upstream requests
-// - [ ] Implement caching for frequently accessed content
-// - [ ] Add concurrent limits to prevent resource exhaustion
-//
+	"golang.org/x/time/rate"
+)
 
 // ### 7. **Configuration Management**
 // - [ ] Make server address configurable via flags/env vars
@@ -44,11 +34,43 @@ const (
 	proxyRequestLimit = 64 * 1024 // 64KB
 	proxyHeaderLimit  = 8 * 1024  // 8KB
 
+	upstreamDialTimeout    = 10 * time.Second
+	upstreamRequestTimeout = 30 * time.Second
+	upstreamIdleTimeout    = 90 * time.Second
+
 	forbiddenHostsFileName = "forbidden-hosts.txt"
 	forbiddenWordsFileName = "banned-words.txt"
 )
 
+var (
+	ipLimiters = make(map[string]*rate.Limiter)
+	mu         sync.RWMutex
+)
+
+func getRateLimiter(ip string) *rate.Limiter {
+	mu.Lock()
+	defer mu.Unlock()
+
+	limiter, exists := ipLimiters[ip]
+	if !exists {
+		limiter = rate.NewLimiter(5, 1) // 5 req/sec, burst of 1
+		ipLimiters[ip] = limiter
+	}
+	return limiter
+}
+
 func forwardProxy(w http.ResponseWriter, originalReq *http.Request) {
+	clientIP, _, err := net.SplitHostPort(originalReq.RemoteAddr)
+	if err != nil {
+		clientIP = originalReq.RemoteAddr
+		log.Printf("WARNING: Could not parse client address %s, using full address", originalReq.RemoteAddr)
+	}
+
+	limiter := getRateLimiter(clientIP)
+	if !limiter.Allow() {
+		http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
 	if originalReq.URL.Path == "/health" {
 		healthHandler(w)
 		return
@@ -58,12 +80,6 @@ func forwardProxy(w http.ResponseWriter, originalReq *http.Request) {
 	startTime := time.Now()
 	log.Printf("=== INCOMING REQUEST === Target: %s | Client: %s | Method: %s | UserAgent: %s",
 		originalReq.Host, originalReq.RemoteAddr, originalReq.Method, originalReq.UserAgent())
-
-	clientIP, _, err := net.SplitHostPort(originalReq.RemoteAddr)
-	if err != nil {
-		clientIP = originalReq.RemoteAddr
-		log.Printf("WARNING: Could not parse client address %s, using full address", originalReq.RemoteAddr)
-	}
 
 	log.Printf("CLIENT_INFO: IP=%s | URL_PATH=%s | QUERY=%s", clientIP, originalReq.URL.Path, originalReq.URL.RawQuery)
 
@@ -100,11 +116,29 @@ func forwardProxy(w http.ResponseWriter, originalReq *http.Request) {
 
 func handleHTTP(w http.ResponseWriter, originalReq *http.Request, clientIP string, startTime time.Time) {
 	defer originalReq.Body.Close()
-	client := &http.Client{}
+	client := &http.Client{
+		Timeout: upstreamRequestTimeout,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				d := &net.Dialer{
+					Timeout: upstreamDialTimeout,
+				}
+				return d.DialContext(ctx, network, addr)
+			},
+			IdleConnTimeout:     upstreamIdleTimeout,
+			TLSHandshakeTimeout: 10 * time.Second,
+			// Prevent connection leaks
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+		},
+	}
 	proxyReqUrl := fmt.Sprintf("http://%s%s", originalReq.Host, originalReq.URL.RequestURI())
 	log.Printf("PROXY_REQUEST_START: URL=%s | Client=%s", proxyReqUrl, clientIP)
 
-	proxyReq, err := http.NewRequest(originalReq.Method, proxyReqUrl, originalReq.Body)
+	ctx, cancel := context.WithTimeout(originalReq.Context(), upstreamRequestTimeout)
+	defer cancel()
+
+	proxyReq, err := http.NewRequestWithContext(ctx, originalReq.Method, proxyReqUrl, originalReq.Body)
 	if err != nil {
 		duration := time.Since(startTime)
 		log.Printf("ERROR_REQUEST_CREATION: Client=%s | URL=%s | Error=%v | Duration=%v",
@@ -130,9 +164,15 @@ func handleHTTP(w http.ResponseWriter, originalReq *http.Request, clientIP strin
 
 	if err != nil {
 		totalDuration := time.Since(startTime)
-		log.Printf("ERROR_UPSTREAM_REQUEST: Client=%s | URL=%s | Error=%v | UpstreamDuration=%v | TotalDuration=%v",
-			clientIP, proxyReqUrl, err, upstreamDuration, totalDuration)
-		http.Error(w, "Proxy request failed", http.StatusBadGateway)
+		if ctx.Err() == context.DeadlineExceeded {
+			log.Printf("ERROR_UPSTREAM_TIMEOUT: Client=%s | URL=%s | UpstreamDuration=%v | TotalDuration=%v",
+				clientIP, proxyReqUrl, upstreamDuration, totalDuration)
+			http.Error(w, "Upstream request timeout", http.StatusGatewayTimeout)
+		} else {
+			log.Printf("ERROR_UPSTREAM_REQUEST: Client=%s | URL=%s | Error=%v | UpstreamDuration=%v | TotalDuration=%v",
+				clientIP, proxyReqUrl, err, upstreamDuration, totalDuration)
+			http.Error(w, "Proxy request failed", http.StatusBadGateway)
+		}
 		return
 	}
 	defer res.Body.Close()
@@ -208,6 +248,10 @@ func handleConnect(w http.ResponseWriter, originalReq *http.Request, clientIP st
 		return
 	}
 	defer targetConn.Close()
+
+	tunnelTimeout := 1 * time.Minute // Max tunnel idle time
+	clientConn.SetDeadline(time.Now().Add(tunnelTimeout))
+	targetConn.SetDeadline(time.Now().Add(tunnelTimeout))
 
 	// Send 200 Connection Established through hijacked connection
 	_, err = clientConn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
